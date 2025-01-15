@@ -1,0 +1,7 @@
+streamlit
+duckdb
+pandas
+python-dotenv
+openai
+thefuzz
+python-Levenshtein

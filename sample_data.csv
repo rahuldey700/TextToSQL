@@ -1,0 +1,9 @@
+region,product,sales,month
+West,Widget A,120,Jan
+East,Widget B,450,Jan
+West,Widget A,150,Feb
+East,Widget B,490,Feb
+West,Widget A,130,Mar
+East,Widget B,510,Mar
+West,Widget A,110,Apr
+East,Widget B,470,Apr

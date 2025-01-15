@@ -388,7 +388,18 @@ def main():
     files = st.file_uploader("Upload CSV/XLSX", accept_multiple_files=True, type=["csv","xlsx"])
     if files:
         for f in files:
-            name = f.name.replace(" ","_").replace(".","_").lower()
+            # Strip file extension and any non-alphanumeric characters
+            base_name = os.path.splitext(f.name)[0]  # Remove extension first
+            name = ''.join(c.lower() for c in base_name if c.isalnum())
+            
+            # Ensure name starts with a letter (SQL requirement)
+            if name and not name[0].isalpha():
+                name = 'tbl_' + name
+            
+            # Fallback if name is empty after sanitization
+            if not name:
+                name = 'table_' + str(len(st.session_state["loaded_tables"]))
+            
             if f.name.endswith(".csv"):
                 create_table_from_csv(st.session_state["duckdb_conn"], f, name)
             else:
@@ -402,7 +413,7 @@ def main():
         pick = st.selectbox("Preview a table:", st.session_state["loaded_tables"])
         if pick:
             with st.expander(f"Preview {pick}"):
-                sm = st.session_state["duckdb_conn"].execute(f"SELECT * FROM {pick} LIMIT 5").fetchdf()
+                sm = st.session_state["duckdb_conn"].execute(f'SELECT * FROM "{pick}" LIMIT 5').fetchdf()
                 st.dataframe(sm)
 
     # Agent Interaction (Chat UI)

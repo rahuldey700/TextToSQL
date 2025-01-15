@@ -86,7 +86,8 @@ def fuzzy_match_column(user_input: str, columns: List[str], threshold: int = 70)
     return best if best_score > threshold else user_input
 
 def apply_fuzzy_matching_to_query(sql_query: str, table_names: List[str], conn: duckdb.DuckDBPyConnection) -> str:
-    valid_tables = [t for t in table_names if t != "demo_data"]
+    # valid_tables = [t for t in table_names if t != "demo_data"]
+    valid_tables = table_names 
     all_cols = get_all_columns(conn, valid_tables)
 
     tokens = sql_query.replace(",", " , ").replace("(", " ( ").replace(")", " ) ").split()

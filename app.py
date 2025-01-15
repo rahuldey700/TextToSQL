@@ -2,6 +2,8 @@ import os
 import streamlit as st
 import duckdb
 from dotenv import load_dotenv
+from typing import List
+import re
 
 # LangChain references
 from langchain_core.agents import AgentAction, AgentFinish
@@ -11,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain.agents import Tool, AgentExecutor, create_openai_functions_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.memory import ConversationBufferMemory
 
 # Helpers
 from helpers import (
@@ -20,7 +23,8 @@ from helpers import (
     execute_sql_and_return_results,
     apply_fuzzy_matching_to_query,
     data_cleaning_tool,
-    semantic_column_selection
+    semantic_column_selection,
+    get_all_columns
 )
 
 ####################################
@@ -95,19 +99,102 @@ class StreamlitCallbackHandler(BaseCallbackHandler):
 #        TOOL DEFINITIONS          #
 ####################################
 
+def parse_table_names(sql_query: str) -> List[str]:
+    """
+    Parse the table names from a simple SQL query by looking for 'FROM <table>'.
+    This is a naive approach but works for many straightforward queries.
+    """
+    # Use a case-insensitive regex to capture anything after FROM up until whitespace or punctuation
+    pattern = r'(?i)\bFROM\s+["`]?([\w]+)["`]?'
+    tables = re.findall(pattern, sql_query)
+    # Return unique tables
+    return list(set(t.strip() for t in tables))
+
+
 def run_sql_query_tool(sql_query: str) -> str:
     """
-    Execute the SQL query. If there's a TIMESTAMP error on avg(...),
-    we attempt an auto-cast. Otherwise, handle fuzzy matching or show error.
+    Execute the SQL query, ensuring:
+    1) We gather columns from the *actual* table(s) in the query rather than st.session_state["loaded_tables"][0].
+    2) We skip numeric tokens (e.g. in LIMIT clauses).
+    3) We check each referenced table against loaded tables.
+       If a table isn't loaded, show a friendly message.
+    4) We check the columns that appear in the query vs. the columns in the referenced table(s).
     """
+
     conn = st.session_state["duckdb_conn"]
+    loaded_tables = st.session_state.get("loaded_tables", [])
+
+    # Identify which table(s) the query references
+    referenced_tables = parse_table_names(sql_query)
+    if not referenced_tables:
+        # If user didn't specify a table, and only 1 table is loaded,
+        # we assume they're using that. Otherwise, do nothing special.
+        if len(loaded_tables) == 1:
+            referenced_tables = [loaded_tables[0]]
+        else:
+            # If multiple tables are loaded but user didn't specify, we can't guess which table is intended.
+            pass
+
+    # Verify that each referenced table is actually loaded
+    for tbl in referenced_tables:
+        if tbl not in loaded_tables:
+            return (
+                f"**Table '{tbl}' is not loaded.**\n"
+                "If you need that data, please load it, or check your table name."
+            )
+
+    # Gather columns from each referenced table
+    # If the user references multiple tables, we combine them
+    all_referenced_cols = set()
+    if referenced_tables:
+        all_referenced_cols = get_all_columns(conn, referenced_tables)
+    else:
+        # fallback: if no table is referenced but we only have one, just use its columns
+        if len(loaded_tables) == 1:
+            all_referenced_cols = get_all_columns(conn, [loaded_tables[0]])
+
+    # Tokenize the query to see which parts might be columns
+    import re
+    tokens = re.findall(r'\b[\w]+\b', sql_query)
+
+    # Known SQL keywords to exclude from the missing-column check
+    sql_keywords = {
+        "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "LIMIT",
+        "ASC", "DESC", "COUNT", "MAX", "MIN", "AVG", "SUM", "AS",
+        "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "HAVING"
+    }
+
+    # Build a list of suspected columns that aren't found in all_referenced_cols
+    asked_for = []
+    for t in tokens:
+        # Skip pure numeric tokens (e.g., "1" from LIMIT 1)
+        if t.isdigit():
+            continue
+
+        # Skip if it's a known SQL keyword or if it's recognized as an actual column
+        if t.upper() in sql_keywords or t.lower() in all_referenced_cols:
+            continue
+
+        # Also skip if t is recognized as a table name
+        if t in referenced_tables:
+            continue
+
+        # If it's still here, user might be referencing a non-existent column
+        asked_for.append(t)
+
+    # If user references missing columns, show a friendly message
+    if asked_for:
+        return (
+            f"**The dataset does not have columns related to**: {', '.join(asked_for)}.\n"
+            "If you need specific data, please add columns for them or load a richer dataset."
+        )
+
+    # Now proceed with the query execution
     df, err = execute_sql_and_return_results(conn, sql_query)
 
     if err:
-        # Special check for TIMESTAMP -> numeric aggregator
+        # Check for the TIMESTAMP aggregator error
         if "No function matches the given name and argument types 'avg(TIMESTAMP_NS)'" in err:
-            # We attempt a cast in the query
-            # e.g. SELECT AVG(CAST(overall_rating_out_of_5_ AS DOUBLE)) ...
             cast_query = attempt_timestamp_cast(sql_query)
             if cast_query != sql_query:
                 df2, err2 = execute_sql_and_return_results(conn, cast_query)
@@ -120,8 +207,8 @@ def run_sql_query_tool(sql_query: str) -> str:
                 else:
                     return f"**SQL Error** after cast: {err2}"
 
-        # If it's not the TIMESTAMP aggregator error, attempt fuzzy matching
-        revised = apply_fuzzy_matching_to_query(sql_query, st.session_state["loaded_tables"], conn)
+        # Fuzzy matching attempt
+        revised = apply_fuzzy_matching_to_query(sql_query, loaded_tables, conn)
         if revised != sql_query:
             df2, err2 = execute_sql_and_return_results(conn, revised)
             if not err2:
@@ -135,16 +222,17 @@ def run_sql_query_tool(sql_query: str) -> str:
             else:
                 return f"**SQL Error** after fuzzy-correction: {err2}"
 
+        # If all else fails, show the SQL error
         return f"**SQL Error**: {err}"
-    else:
-        # success
-        preview = df.to_markdown(index=False) if not df.empty else "No results found."
-        return (
-            "### SQL Query\n"
-            + sql_query + "\n"
-            + "### Results\n"
-            + preview
-        )
+
+    # Otherwise, success
+    preview = df.to_markdown(index=False) if not df.empty else "No results found."
+    return (
+        "### SQL Query\n"
+        + sql_query + "\n"
+        + "### Results\n"
+        + preview
+    )
 
 def attempt_timestamp_cast(original_query: str) -> str:
     """
@@ -321,6 +409,14 @@ def build_agent(callbacks=None):
         temperature=0,
         callbacks=callbacks
     )
+
+    # Initialize memory if it doesn't exist in session state
+    if "agent_memory" not in st.session_state:
+        st.session_state["agent_memory"] = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+
     tools = [
         Tool(name="run_sql_query", func=run_sql_query_tool, description="Execute queries on DuckDB"),
         Tool(name="get_schema", func=get_schema_tool, description="Show DB schema"),
@@ -332,9 +428,12 @@ def build_agent(callbacks=None):
     ]
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You can fix columns if TIMESTAMP aggregator fails by casting to DOUBLE. 
+        ("system", f"""You can fix columns if TIMESTAMP aggregator fails by casting to DOUBLE. 
+Currently loaded tables: {', '.join(st.session_state["loaded_tables"])}
 Always finalize with run_sql_query if user wants data.
+Remember previous conversations and use that context when appropriate.
 """),
+        MessagesPlaceholder(variable_name="chat_history"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
         ("user","{input}")
     ])
@@ -348,6 +447,7 @@ Always finalize with run_sql_query if user wants data.
     return AgentExecutor.from_agent_and_tools(
         agent=agent,
         tools=tools,
+        memory=st.session_state["agent_memory"],
         callbacks=callbacks,
         verbose=True
     )
@@ -442,9 +542,9 @@ def main():
         if not user_msg:
             st.warning("Please type something.")
             return
-        # Add user msg to history
+        
+        # Add user message to chat history
         st.session_state["chat_history"].append({"role":"user","content":user_msg})
-        # Clear input
         st.session_state["user_input"] = ""
 
         # Show conversation again
@@ -456,7 +556,10 @@ def main():
 
         with st.spinner("Thinking..."):
             try:
-                ans_dict = agent.invoke({"input":user_msg})
+                ans_dict = agent.invoke({
+                    "input": user_msg,
+                    "chat_history": st.session_state["chat_history"]
+                })
                 ans = ans_dict.get("output", "") if isinstance(ans_dict, dict) else ans_dict
                 if ans.strip():
                     # Add agent answer to chat history

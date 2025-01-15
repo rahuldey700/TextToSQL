@@ -11,21 +11,32 @@ import re
 
 def auto_sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert column names to simpler forms:
+    Convert column names to SQL-friendly forms:
       - Lowercase
-      - Replace spaces & parentheses with underscores
-      - Remove special chars
+      - Replace spaces & special chars with underscores
+      - Ensure starts with letter
+      - Remove invalid characters
+      - Avoid SQL reserved words
     Returns the updated DataFrame.
     """
     new_cols = []
     for c in df.columns:
-        # Lowercase
-        col = c.lower()
-        # Replace parentheses or spaces with underscores
-        col = re.sub(r"[()\s]+", "_", col)
-        # Remove any other non-alphanumeric except underscores
-        col = re.sub(r"[^a-z0-9_]+", "", col)
+        # First pass: basic sanitization
+        col = sanitize_sql_name(c)
+        
+        # If still not SQL-friendly, prefix with 'col_'
+        if not is_sql_friendly_name(col):
+            col = 'col_' + col
+            
+        # Handle duplicates by adding numbers
+        base_col = col
+        counter = 1
+        while col in new_cols:
+            col = f"{base_col}_{counter}"
+            counter += 1
+            
         new_cols.append(col)
+    
     df.columns = new_cols
     return df
 
@@ -57,12 +68,70 @@ def get_schema_description(conn: duckdb.DuckDBPyConnection, tables: List[str]) -
     return "\n".join(lines)
 
 def get_all_columns(conn: duckdb.DuckDBPyConnection, tables: List[str]) -> Set[str]:
+    """
+    Return a set of all column names (lowercased) across the given tables.
+    """
     all_cols = set()
     for tbl in tables:
-        schema_data = inspect_schema(conn, tbl)
-        for cname, _ctype in schema_data:
-            all_cols.add(cname)
+        try:
+            schema_data = conn.execute(f'DESCRIBE "{tbl}"').fetchall()
+            for row in schema_data:
+                col_name = row[0].lower()  # row[0] is the column name
+                all_cols.add(col_name)
+        except Exception:
+            # If table doesn't exist or some error, skip
+            pass
     return all_cols
+
+def is_sql_friendly_name(name: str) -> bool:
+    """
+    Check if a column name is SQL-friendly:
+    - Starts with a letter
+    - Contains only letters, numbers, and underscores
+    - Not a SQL reserved word
+    """
+    if not name:
+        return False
+    
+    # Must start with letter
+    if not name[0].isalpha():
+        return False
+    
+    # Only allow letters, numbers, underscores
+    if not all(c.isalnum() or c == '_' for c in name):
+        return False
+    
+    # Common SQL reserved words to avoid
+    sql_reserved = {
+        'select', 'from', 'where', 'group', 'order', 'by', 'having',
+        'join', 'inner', 'outer', 'left', 'right', 'on', 'as', 'case',
+        'when', 'then', 'else', 'end', 'and', 'or', 'not', 'null',
+        'true', 'false', 'like', 'in', 'between', 'is', 'exists'
+    }
+    
+    return name.lower() not in sql_reserved
+
+def sanitize_sql_name(name: str) -> str:
+    """
+    Convert a name to SQL-friendly format:
+    - Replace spaces and special chars with underscores
+    - Ensure starts with letter
+    - Remove any other invalid characters
+    """
+    # Convert to lowercase and replace spaces/special chars with underscore
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', name.lower())
+    
+    # Ensure starts with letter
+    if not clean[0].isalpha():
+        clean = 'col_' + clean
+    
+    # Remove duplicate underscores
+    clean = re.sub(r'_+', '_', clean)
+    
+    # Trim underscores from ends
+    clean = clean.strip('_')
+    
+    return clean
 
 #############################
 #   SQL VALIDATION & FUZZY
@@ -85,24 +154,61 @@ def fuzzy_match_column(user_input: str, columns: List[str], threshold: int = 70)
             best = col
     return best if best_score > threshold else user_input
 
-def apply_fuzzy_matching_to_query(sql_query: str, table_names: List[str], conn: duckdb.DuckDBPyConnection) -> str:
-    # valid_tables = [t for t in table_names if t != "demo_data"]
-    valid_tables = table_names 
-    all_cols = get_all_columns(conn, valid_tables)
+# helpers.py
 
-    tokens = sql_query.replace(",", " , ").replace("(", " ( ").replace(")", " ) ").split()
+def apply_fuzzy_matching_to_query(
+    sql_query: str,
+    table_names: List[str],
+    conn: duckdb.DuckDBPyConnection
+) -> str:
+    """
+    We only allow one table at a time, so we ignore any table reference 
+    from the user and force references to that single known table. 
+    We only fuzzy-match columns.
+    """
+    # If there's exactly one table loaded, let's get it:
+    if len(table_names) == 1:
+        single_table = table_names[0]
+    else:
+        # Fallback if somehow multiple tables exist
+        return sql_query  # do nothing special
+    
+    # Get all columns for that single table
+    all_cols = get_all_columns(conn, [single_table])  # your existing helper
+
+    import re
+    tokens = re.split(r'(\s+|\W+)', sql_query)  # split on whitespace or punctuation
+
     revised_tokens = []
     for tok in tokens:
-        raw = tok.strip('"[]\'')
-        if raw in all_cols:
-            revised_tokens.append(tok)
+        raw_tok = tok.strip('"`[] ')
+
+        # If the token is the user-typed table name, forcibly replace it 
+        # with our single_table, ignoring any user-typed reference:
+        # (or if the user typed anything that looks like a table name, we ignore it)
+        if raw_tok.lower() == single_table.lower():
+            revised_tokens.append(f'"{single_table}"')
+            continue
+
+        # Check if the token matches a column (exact)
+        if raw_tok in all_cols:
+            revised_tokens.append(tok)  # keep as is
+            continue
+        
+        # Attempt fuzzy match on columns only
+        matched_col = fuzzy_match_column(raw_tok, list(all_cols), threshold=80)
+        if matched_col != raw_tok:
+            revised_tokens.append(f'"{matched_col}"')
         else:
-            matched = fuzzy_match_column(raw, list(all_cols))
-            if matched != raw:
-                revised_tokens.append(f'"{matched}"')
-            else:
-                revised_tokens.append(tok)
-    return " ".join(revised_tokens)
+            revised_tokens.append(tok)
+
+    # Now forcibly replace any FROM clauses with the single_table:
+    # e.g. if user wrote "FROM some_fake_name", override to single_table.
+    # This is optional if you want to guarantee the user can’t override the table name:
+    revised_query = "".join(revised_tokens)
+    revised_query = re.sub(r'(?i)\bFROM\s+["`]?[\w]+["`]?\b', f'FROM "{single_table}"', revised_query)
+
+    return revised_query
 
 #############################
 #   DATA LOADING

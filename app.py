@@ -166,22 +166,31 @@ def run_sql_query_tool(sql_query: str) -> str:
 
     # Build a list of suspected columns that aren't found in all_referenced_cols
     asked_for = []
+    skip_next_token = False  # New: track if next token is an alias
+    
     for t in tokens:
-        # Skip pure numeric tokens (e.g., "1" from LIMIT 1)
+        # Skip aliases after 'AS' keyword
+        if skip_next_token:
+            skip_next_token = False
+            continue
+            
+        # Mark next token to skip if it's after 'AS'
+        if t.upper() == "AS":
+            skip_next_token = True
+            continue
+            
+        # Rest of token checks (numeric, keywords, etc)
         if t.isdigit():
             continue
-
-        # Skip if it's a known SQL keyword or if it's recognized as an actual column
+            
         if t.upper() in sql_keywords or t.lower() in all_referenced_cols:
             continue
-
-        # Also skip if t is recognized as a table name
+            
         if t in referenced_tables:
             continue
-
-        # If it's still here, user might be referencing a non-existent column
+            
         asked_for.append(t)
-
+        
     # If user references missing columns, show a friendly message
     if asked_for:
         return (

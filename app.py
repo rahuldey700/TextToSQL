@@ -116,134 +116,108 @@ def parse_table_names(sql_query: str) -> List[str]:
 def run_sql_query_tool(sql_query: str) -> str:
     """
     Execute the SQL query, ensuring:
-    1) We gather columns from the *actual* table(s) in the query rather than st.session_state["loaded_tables"][0].
-    2) We skip numeric tokens (e.g. in LIMIT clauses).
-    3) We check each referenced table against loaded tables.
-       If a table isn't loaded, show a friendly message.
-    4) We check the columns that appear in the query vs. the columns in the referenced table(s).
+    1) Ignore numeric tokens (e.g. LIMIT 1).
+    2) Ignore column aliases (the token after 'AS').
+    3) Check if referenced tables are actually loaded.
+    4) Check if referenced columns exist in those tables.
     """
-
     conn = st.session_state["duckdb_conn"]
     loaded_tables = st.session_state.get("loaded_tables", [])
 
     # Identify which table(s) the query references
     referenced_tables = parse_table_names(sql_query)
-    if not referenced_tables:
-        # If user didn't specify a table, and only 1 table is loaded,
-        # we assume they're using that. Otherwise, do nothing special.
-        if len(loaded_tables) == 1:
-            referenced_tables = [loaded_tables[0]]
-        else:
-            # If multiple tables are loaded but user didn't specify, we can't guess which table is intended.
-            pass
+    if not referenced_tables and len(loaded_tables) == 1:
+        # If no FROM clause but only one table is loaded:
+        referenced_tables = [loaded_tables[0]]
 
-    # Verify that each referenced table is actually loaded
+    # Check if table(s) are loaded
     for tbl in referenced_tables:
         if tbl not in loaded_tables:
             return (
                 f"**Table '{tbl}' is not loaded.**\n"
-                "If you need that data, please load it, or check your table name."
+                "If you need that data, please load it, or correct your table name."
             )
 
-    # Gather columns from each referenced table
-    # If the user references multiple tables, we combine them
+    # Gather columns from referenced tables
     all_referenced_cols = set()
     if referenced_tables:
         all_referenced_cols = get_all_columns(conn, referenced_tables)
-    else:
-        # fallback: if no table is referenced but we only have one, just use its columns
-        if len(loaded_tables) == 1:
-            all_referenced_cols = get_all_columns(conn, [loaded_tables[0]])
+    elif len(loaded_tables) == 1:
+        all_referenced_cols = get_all_columns(conn, [loaded_tables[0]])
 
-    # Tokenize the query to see which parts might be columns
     import re
-    tokens = re.findall(r'\b[\w]+\b', sql_query)
+    tokens = re.findall(r"\b[\w]+\b", sql_query)
 
-    # Known SQL keywords to exclude from the missing-column check
     sql_keywords = {
         "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "LIMIT",
         "ASC", "DESC", "COUNT", "MAX", "MIN", "AVG", "SUM", "AS",
         "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "HAVING"
     }
 
-    # Build a list of suspected columns that aren't found in all_referenced_cols
     asked_for = []
-    skip_next_token = False  # New: track if next token is an alias
-    
+    skip_next_token = False
+
     for t in tokens:
-        # Skip aliases after 'AS' keyword
+        # If we flagged the next token as an alias, skip it
         if skip_next_token:
             skip_next_token = False
             continue
-            
-        # Mark next token to skip if it's after 'AS'
+
+        # If this token is 'AS', then the next token is an alias → skip next
         if t.upper() == "AS":
             skip_next_token = True
             continue
-            
-        # Rest of token checks (numeric, keywords, etc)
+
+        # Skip if numeric (e.g., LIMIT 1)
         if t.isdigit():
             continue
-            
+
+        # Skip SQL keywords or columns that really exist
         if t.upper() in sql_keywords or t.lower() in all_referenced_cols:
             continue
-            
+
+        # Skip any table name
         if t in referenced_tables:
             continue
-            
+
+        # If we get here, it's a "missing" column
         asked_for.append(t)
-        
-    # If user references missing columns, show a friendly message
+
     if asked_for:
         return (
             f"**The dataset does not have columns related to**: {', '.join(asked_for)}.\n"
             "If you need specific data, please add columns for them or load a richer dataset."
         )
 
-    # Now proceed with the query execution
+    # Attempt to run the query
     df, err = execute_sql_and_return_results(conn, sql_query)
-
     if err:
-        # Check for the TIMESTAMP aggregator error
+        # Specifically handle aggregator mismatch on TIMESTAMP columns
         if "No function matches the given name and argument types 'avg(TIMESTAMP_NS)'" in err:
             cast_query = attempt_timestamp_cast(sql_query)
             if cast_query != sql_query:
                 df2, err2 = execute_sql_and_return_results(conn, cast_query)
                 if not err2:
                     prev = df2.to_markdown(index=False) if not df2.empty else "No results found."
-                    return (
-                        "### SQL Query\n" + cast_query + "\n"
-                        + "### Results\n" + prev
-                    )
+                    return "### SQL Query\n" + cast_query + "\n### Results\n" + prev
                 else:
-                    return f"**SQL Error** after cast: {err2}"
-
-        # Fuzzy matching attempt
+                    return f"**SQL Error** after casting timestamp: {err2}"
+        
+        # Fuzzy matching fallback
         revised = apply_fuzzy_matching_to_query(sql_query, loaded_tables, conn)
         if revised != sql_query:
             df2, err2 = execute_sql_and_return_results(conn, revised)
             if not err2:
                 preview2 = df2.to_markdown(index=False) if not df2.empty else "No results found."
-                return (
-                    "### SQL Query\n"
-                    + revised + "\n"
-                    + "### Results\n"
-                    + preview2
-                )
+                return "### SQL Query\n" + revised + "\n### Results\n" + preview2
             else:
                 return f"**SQL Error** after fuzzy-correction: {err2}"
 
-        # If all else fails, show the SQL error
         return f"**SQL Error**: {err}"
 
-    # Otherwise, success
+    # Success
     preview = df.to_markdown(index=False) if not df.empty else "No results found."
-    return (
-        "### SQL Query\n"
-        + sql_query + "\n"
-        + "### Results\n"
-        + preview
-    )
+    return "### SQL Query\n" + sql_query + "\n### Results\n" + preview
 
 def attempt_timestamp_cast(original_query: str) -> str:
     """

@@ -347,3 +347,40 @@ def semantic_column_selection(
             if cname in qlower:
                 matched.append(f"{tbl}.{cname}")
     return matched
+
+def semantic_col_selector_tool(args: str) -> str:
+    """
+    Return potential columns from loaded tables that might be relevant.
+    If no exact match, just provide all columns from relevant tables so
+    the user or agent can refine.
+    """
+    conn = st.session_state["duckdb_conn"]
+    loaded_tables = st.session_state.get("loaded_tables", [])
+    if not loaded_tables:
+        return "No tables loaded."
+
+    # If the user passes something like user_question='Which region has the most products sold?'
+    # you can optionally parse out keywords, then check columns. For now, let's simplify:
+    user_q = args.strip()
+    if "=" in args:  # might be "user_question=some question"
+        data = {}
+        for p in args.split(","):
+            if "=" in p:
+                k, v = p.split("=",1)
+                data[k.strip()] = v.strip()
+        user_q = data.get("user_question", user_q)
+
+    if not user_q:
+        return "No question provided."
+
+    # For each table, gather columns
+    all_suggestions = []
+    for t in loaded_tables:
+        col_list = get_all_columns(conn, [t])
+        all_suggestions.extend( [f"{t}.{c}" for c in col_list] )
+
+    # Return them to the LLM so it can pick any that might be relevant
+    if all_suggestions:
+        return f"Potential columns: {', '.join(all_suggestions)}"
+    else:
+        return "No columns found in loaded tables."

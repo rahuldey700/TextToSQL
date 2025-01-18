@@ -115,11 +115,9 @@ def parse_table_names(sql_query: str) -> List[str]:
 
 def run_sql_query_tool(sql_query: str) -> str:
     """
-    Execute the SQL query, ensuring:
-    1) Ignore numeric tokens (e.g. LIMIT 1).
-    2) Ignore column aliases (the token after 'AS').
-    3) Check if referenced tables are actually loaded.
-    4) Check if referenced columns exist in those tables.
+    Execute the SQL query on DuckDB.
+    If aggregator mismatch on a timestamp, attempt casting.
+    If error persists, try fuzzy matching columns.
     """
     conn = st.session_state["duckdb_conn"]
     loaded_tables = st.session_state.get("loaded_tables", [])
@@ -127,10 +125,10 @@ def run_sql_query_tool(sql_query: str) -> str:
     # Identify which table(s) the query references
     referenced_tables = parse_table_names(sql_query)
     if not referenced_tables and len(loaded_tables) == 1:
-        # If no FROM clause but only one table is loaded:
+        # If user didn't specify any table name, but exactly one table is loaded, assume that table
         referenced_tables = [loaded_tables[0]]
 
-    # Check if table(s) are loaded
+    # Check if all referenced tables are actually loaded
     for tbl in referenced_tables:
         if tbl not in loaded_tables:
             return (
@@ -138,61 +136,13 @@ def run_sql_query_tool(sql_query: str) -> str:
                 "If you need that data, please load it, or correct your table name."
             )
 
-    # Gather columns from referenced tables
-    all_referenced_cols = set()
-    if referenced_tables:
-        all_referenced_cols = get_all_columns(conn, referenced_tables)
-    elif len(loaded_tables) == 1:
-        all_referenced_cols = get_all_columns(conn, [loaded_tables[0]])
+    # Removed the manual unknown-token logic here
+    # Let DuckDB itself validate columns or throw errors.
 
-    import re
-    tokens = re.findall(r"\b[\w]+\b", sql_query)
-
-    sql_keywords = {
-        "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "LIMIT",
-        "ASC", "DESC", "COUNT", "MAX", "MIN", "AVG", "SUM", "AS",
-        "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "HAVING"
-    }
-
-    asked_for = []
-    skip_next_token = False
-
-    for t in tokens:
-        # If we flagged the next token as an alias, skip it
-        if skip_next_token:
-            skip_next_token = False
-            continue
-
-        # If this token is 'AS', then the next token is an alias → skip next
-        if t.upper() == "AS":
-            skip_next_token = True
-            continue
-
-        # Skip if numeric (e.g., LIMIT 1)
-        if t.isdigit():
-            continue
-
-        # Skip SQL keywords or columns that really exist
-        if t.upper() in sql_keywords or t.lower() in all_referenced_cols:
-            continue
-
-        # Skip any table name
-        if t in referenced_tables:
-            continue
-
-        # If we get here, it's a "missing" column
-        asked_for.append(t)
-
-    if asked_for:
-        return (
-            f"**The dataset does not have columns related to**: {', '.join(asked_for)}.\n"
-            "If you need specific data, please add columns for them or load a richer dataset."
-        )
-
-    # Attempt to run the query
+    # Attempt the query
     df, err = execute_sql_and_return_results(conn, sql_query)
     if err:
-        # Specifically handle aggregator mismatch on TIMESTAMP columns
+        # If aggregator mismatch on timestamp, attempt automatic CAST
         if "No function matches the given name and argument types 'avg(TIMESTAMP_NS)'" in err:
             cast_query = attempt_timestamp_cast(sql_query)
             if cast_query != sql_query:
@@ -202,8 +152,9 @@ def run_sql_query_tool(sql_query: str) -> str:
                     return "### SQL Query\n" + cast_query + "\n### Results\n" + prev
                 else:
                     return f"**SQL Error** after casting timestamp: {err2}"
-        
-        # Fuzzy matching fallback
+
+        # Attempt fuzzy matching fallback if DuckDB complained about unknown column
+        # or other syntax issues
         revised = apply_fuzzy_matching_to_query(sql_query, loaded_tables, conn)
         if revised != sql_query:
             df2, err2 = execute_sql_and_return_results(conn, revised)
@@ -215,7 +166,7 @@ def run_sql_query_tool(sql_query: str) -> str:
 
         return f"**SQL Error**: {err}"
 
-    # Success
+    # If no error, return results
     preview = df.to_markdown(index=False) if not df.empty else "No results found."
     return "### SQL Query\n" + sql_query + "\n### Results\n" + preview
 

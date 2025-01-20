@@ -39,9 +39,11 @@ class StreamlitCallbackHandler(BaseCallbackHandler):
     Displays chain-of-thought, final queries, and final answers
     in a chat-like "Agent Interaction" section.
     """
-    def __init__(self, container):
+    def __init__(self, container, conversation_container):
         super().__init__()
         self.container = container  # The container is the "Agent Interaction" chat box
+        self.conversation_container = conversation_container  # Main conversation area
+        self.last_sql_query = None  # Store the last SQL query
 
     def on_tool_start(self, serialized, input_str: str, **kwargs):
         tool_name = serialized.get('name','unknown_tool')
@@ -55,12 +57,16 @@ class StreamlitCallbackHandler(BaseCallbackHandler):
             self.container.markdown(f"**Tool Input**: {input_str}")
 
     def on_tool_end(self, output: str, **kwargs):
+        self.last_sql_query = None  # Reset SQL query
         if "### SQL Query" in output:
             # Typical format: "### SQL Query\n ... ### Results\n ..."
             parts = output.split("### Results")
             if len(parts)>1:
                 sql_part = parts[0].replace("### SQL Query","").strip()
                 results_part = parts[1].strip()
+                
+                # Store the SQL query for final display
+                self.last_sql_query = sql_part
 
                 self.container.markdown("**Final SQL Query**:")
                 self.container.code(sql_part, language="sql")
@@ -80,7 +86,10 @@ class StreamlitCallbackHandler(BaseCallbackHandler):
 
     def on_chain_end(self, outputs, **kwargs):
         final = outputs.get('output','')
-        self.container.markdown(f"**Agent Final Answer**: {final}")
+        # If we have a SQL query, include it in the final response
+        if self.last_sql_query:
+            final = f"**Final SQL Query**:\n```sql\n{self.last_sql_query}\n```\n\n**Results**:\n{final}"
+        self.conversation_container.markdown(final)
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         self.container.markdown("*LLM thinking...*")
@@ -478,30 +487,22 @@ def main():
         if not user_msg:
             st.warning("Please type something.")
             return
-        
-        # Add user message to chat history
         st.session_state["chat_history"].append({"role":"user","content":user_msg})
         st.session_state["user_input"] = ""
 
-        # Show conversation again
         conversation_container.markdown(f"**You**: {user_msg}")
 
-        # Run agent
-        cb_handler = StreamlitCallbackHandler(debug_container)
+        # Pass both containers to the callback handler
+        cb_handler = StreamlitCallbackHandler(debug_container, conversation_container)
         agent = build_agent(callbacks=[cb_handler])
 
         with st.spinner("Thinking..."):
             try:
-                ans_dict = agent.invoke({
-                    "input": user_msg,
-                    "chat_history": st.session_state["chat_history"]
-                })
+                ans_dict = agent.invoke({"input":user_msg})
                 ans = ans_dict.get("output", "") if isinstance(ans_dict, dict) else ans_dict
                 if ans.strip():
-                    # Add agent answer to chat history
                     st.session_state["chat_history"].append({"role":"assistant","content":ans})
-                    # Display agent in conversation
-                    conversation_container.markdown(f"**Agent**: {ans}")
+                    # Note: We don't need to display the answer here as the callback handler will do it
             except Exception as e:
                 st.error(f"Agent error: {e}")
 
